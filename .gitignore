@@ -1,0 +1,42 @@
+# 환경변수 (절대 커밋 금지)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 로그
+*.log
+logs/
+!logs/.gitkeep
+
+# LangGraph 체크포인터 로컬 캐시
+*.sqlite
+langgraph_checkpoint*
+
+# 런타임 상태 파일 (재시작 시 재생성)
+data/
+
+# 백업 ZIP
+*.zip
+*.pap
+
+# Claude Code 내부
+.claude/

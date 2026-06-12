@@ -1,0 +1,27 @@
+{
+  "apps": [
+    {
+      "name": "autostock",
+      "script": "main.py",
+      "interpreter": "python",
+      "args": "--serve",
+      "watch": false,
+      "autorestart": true,
+      "max_memory_restart": "500M",
+      "kill_timeout": 8000,
+      "restart_delay": 5000,
+      "max_restarts": 10,
+      "min_uptime": "10s",
+      "env": {
+        "NODE_ENV": "development"
+      },
+      "env_production": {
+        "NODE_ENV": "production"
+      },
+      "log_date_format": "YYYY-MM-DD HH:mm:ss",
+      "error_file": "logs/server_err.log",
+      "out_file": "logs/server_out.log",
+      "merge_logs": true
+    }
+  ]
+}
