@@ -37,6 +37,7 @@ data/
 # 백업 ZIP
 *.zip
 *.pap
+*.dzip
 
 # Claude Code 내부
 .claude/
