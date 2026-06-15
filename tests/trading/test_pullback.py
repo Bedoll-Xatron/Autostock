@@ -92,18 +92,18 @@ async def test_pullback_outside_tolerance_waits():
 @pytest.mark.unit
 @pytest.mark.anyio
 async def test_limit_buy_with_pullback_no_pullback_returns_false():
-    """눌림 미발생(포기) 시 limit_buy_with_pullback은 (False, 0) 반환."""
+    """눌림 미발생(포기) 시 limit_buy_with_pullback은 (0, 0) 반환."""
     past_timeout = dtime(9, 46)
     with patch("autostock.trading.limit_order._get_now_kst", return_value=past_timeout):
-        success, price = await limit_buy_with_pullback("000000", qty=10)
-    assert success is False
+        filled_qty, price = await limit_buy_with_pullback("000000", qty=10)
+    assert filled_qty == 0
     assert price == 0
 
 
 @pytest.mark.unit
 @pytest.mark.anyio
 async def test_limit_buy_with_pullback_fills_on_success():
-    """눌림 도달 → 체결 성공 시 (True, target) 반환."""
+    """눌림 도달 → 전량 체결 시 (qty, target) 반환."""
     ma_price = 10000.0
     cur_price = 10030.0
     in_window = dtime(9, 20)
@@ -117,6 +117,30 @@ async def test_limit_buy_with_pullback_fills_on_success():
         patch("autostock.trading.limit_order.get_order_fill_qty", return_value=10),
         patch("asyncio.sleep", new_callable=AsyncMock),
     ):
-        success, fill_price = await limit_buy_with_pullback("000000", qty=10)
-    assert success is True
+        filled_qty, fill_price = await limit_buy_with_pullback("000000", qty=10)
+    assert filled_qty == 10
     assert fill_price > 0
+
+
+@pytest.mark.unit
+@pytest.mark.anyio
+async def test_limit_buy_with_pullback_partial_fill_returns_partial():
+    """부분 체결(타임아웃) 시 체결분만 반환하고 잔량 취소."""
+    ma_price = 10000.0
+    cur_price = 10030.0
+    in_window = dtime(9, 20)
+
+    with (
+        patch("autostock.trading.limit_order._get_now_kst", return_value=in_window),
+        patch("autostock.trading.limit_order.get_intraday_5min", return_value=_bars(ma_price)),
+        patch("autostock.trading.limit_order.get_current_price", return_value=cur_price),
+        patch("autostock.trading.limit_order.limit_buy",
+              return_value={"output": {"ODNO": "ORD001"}}),
+        patch("autostock.trading.limit_order.get_order_fill_qty", return_value=4),  # 10주 중 4주만
+        patch("autostock.trading.limit_order.cancel_order", return_value=True) as cancel,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
+        filled_qty, fill_price = await limit_buy_with_pullback("000000", qty=10)
+    assert filled_qty == 4
+    assert fill_price > 0
+    cancel.assert_called_once()

@@ -36,6 +36,11 @@ def _fetch_realtime_pnl(lookback_days: int) -> list[float]:
     for d in decisions:
         ticker = d.get("ticker", "")
         entry_price = float(d.get("price_reference") or 0)
+        # 실제 체결가 우선: open_price × (1 + 슬리피지%). 없으면 AI 기준가 폴백
+        open_p = float(d.get("open_price") or 0)
+        slip = d.get("entry_slippage_pct")
+        if open_p > 0 and slip is not None:
+            entry_price = open_p * (1 + float(slip) / 100)
         if not ticker or entry_price <= 0:
             continue
 

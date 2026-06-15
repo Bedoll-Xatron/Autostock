@@ -2,7 +2,7 @@
 트레일링 손절 감시 — asyncio background task.
 
 3단계 손절 전략:
-  Phase 1 (stop): 진입가 대비 -3% 고정 손절선, +2% 미만 구간에서 유지
+  Phase 1 (stop): 진입가 대비 ATR 기반 손절선 (종목별 2.5~6%, 기본 3%), +2% 미만 구간에서 유지
   Phase 2 (even): +2% 도달 시 손절가를 진입가(본전)로 1회 인상
   Phase 3 (trail): +5% 돌파 시 peak 기준 2.5% trailing 활성화
 
@@ -15,7 +15,7 @@
   - Phase 3 진입: price >= entry × 1.05 → trailing 활성화 (stop/even 양쪽에서 직행 가능)
   - Phase 3: price > peak → peak 갱신, stop = peak × (1 - PROFIT_TRAIL_PCT)
              price <= stop → 익절 매도
-  - 매도 실패 시 최대 3회 재시도 후 텔레그램 알림
+  - 매도 실패 시 trail 폭을 3 → 5 → 7%로 확대하며 최대 3회 재시도 후 텔레그램 알림
   - 15:20 KST 이후 → 잔여 종목 held_positions 저장 (루프는 유지, 다음 날 재개)
   - 서버 재시작 시 held_positions 로드 → 감시 재개
 
@@ -24,6 +24,7 @@
   - 외부 프로세스: save_held_position() 후 ~5분 내 Supabase 재동기화로 자동 감지
 """
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
@@ -47,7 +48,9 @@ STOP_LOSS_PCT       = 3.0       # 진입가 대비 고정 손절 (%)
 BREAKEVEN_TRIGGER_PCT = 2.0     # 본전 보호 활성화 기준 수익률 (%)
 PROFIT_TRIGGER_PCT  = 5.0       # trailing 활성화 기준 수익률 (%)
 PROFIT_TRAIL_PCT    = 2.5       # trailing 활성화 후 peak 대비 trail (%)
-SELL_RETRY_COUNT    = 3         # 매도 실패 시 재시도 횟수
+SELL_RETRY_TRAIL_START = 3.0    # 매도 실패 시 1차 trail 폭 (%)
+SELL_RETRY_TRAIL_STEP  = 2.0    # 실패할 때마다 확대 폭 → 3 → 5 → 7
+SELL_RETRY_TRAIL_MAX   = 7.0    # 최대 trail 폭 (3차 재시도)
 RETRY_WAIT_SEC      = 10        # 재시도 대기 (초)
 
 FAST_TRAIL_PCT        = 4.0     # fast mode trail (%) → 3, 7, 11% 구간
@@ -191,11 +194,132 @@ def _save_remaining(pos_map: dict[str, "TrailingPosition"]) -> None:
         db.save_held_position(pos.to_dict())
 
 
+def _auto_sell_allowed() -> tuple[bool, str]:
+    """자동 손절 매도 허용 여부 + 모드 문자열.
+
+    안전핀: 모의투자는 항상 허용. 실거래(KIS_SIMULATED_MODE=false)는
+    REAL_AUTO_SELL_CONFIRMED=true 환경변수가 명시될 때만 허용한다.
+    실거래 전환 시 사용자가 의식적으로 안전핀을 풀어야 자동 매도가 동작.
+    """
+    from autostock.trading.kis_client import get_kis_simulated
+    if get_kis_simulated():
+        return True, "simulated"
+    if os.getenv("REAL_AUTO_SELL_CONFIRMED", "false").lower() == "true":
+        return True, "real_confirmed"
+    return False, "real_unconfirmed"
+
+
 async def _sell_with_retry(pos: "TrailingPosition", trigger_price: float, reason: str) -> bool:
-    """정보 전용 모드: 실제 매도 금지, 텔레그램 알림만 전송 후 모니터링 종료."""
-    log.info("[%s] %s 알림 발생 (실제 매도는 금지됨) 현재가=%.0f stop=%.0f",
-             pos.ticker, reason, trigger_price, pos.stop_price)
-    return True
+    """손절/익절/Time stop 트리거 시 실제 시장가 매도.
+
+    실패 시 trail 폭을 3 → 5 → 7%로 확대하며 최대 3회 재시도 (macmini 방식 복원).
+    확대 시 손절가를 peak 기준으로 더 넓게 갱신하고 텔레그램으로 재시도를 알린다.
+
+    안전핀: 실거래에서 REAL_AUTO_SELL_CONFIRMED 미설정이면 매도하지 않고 False를
+    반환한다 (호출부가 pending_sell + 수동 매도 알림으로 폴백).
+
+    Returns:
+        True  — 매도 성공 (또는 이미 보유 0)
+        False — 안전핀 미해제 / 매도 전량 실패 (수동 폴백 필요)
+    """
+    from autostock.trading.kis_client import round_to_tick
+
+    allowed, mode = _auto_sell_allowed()
+    if not allowed:
+        log.warning(
+            "[%s] %s 트리거 — 실거래 자동 손절 안전핀 미해제(REAL_AUTO_SELL_CONFIRMED) "
+            "→ 자동 매도 보류, 수동 매도 필요", pos.ticker, reason,
+        )
+        return False
+
+    # 실제 보유 수량 확인 (유령 포지션 오매도 방지)
+    qty = await asyncio.to_thread(get_holding_qty, pos.ticker)
+    if qty <= 0:
+        log.info("[%s] 보유 수량 0 — 매도 스킵 (이미 정리됨)", pos.ticker)
+        return True
+
+    original_stop = pos.stop_price  # M5: 확대 후 전량 실패 시 원복용
+    trail = SELL_RETRY_TRAIL_START
+    attempt = 0
+    while trail <= SELL_RETRY_TRAIL_MAX:
+        attempt += 1
+        try:
+            await asyncio.to_thread(market_sell, pos.ticker, qty)
+            log.info("[%s] %s 시장가 매도 성공 (시도 %d, trail=%.0f%%, qty=%d, mode=%s, 현재가=%.0f)",
+                     pos.ticker, reason, attempt, trail, qty, mode, trigger_price)
+            return True
+        except Exception as e:
+            next_trail = trail + SELL_RETRY_TRAIL_STEP
+            if next_trail > SELL_RETRY_TRAIL_MAX:
+                log.error("[%s] %s 매도 최종 실패 (시도 %d, trail=%.0f%%): %s — 손절가 원복",
+                          pos.ticker, reason, attempt, trail, e)
+                pos.stop_price = original_stop  # 확대분 잔류 방지(다음 트리거 지연 방지)
+                return False
+            log.error(
+                "[%s] %s 매도 실패 (시도 %d, trail=%.0f%%): %s — %.0f%%로 확대 후 %d초 대기",
+                pos.ticker, reason, attempt, trail, e, next_trail, RETRY_WAIT_SEC,
+            )
+            # 손절 폭 확대 반영 (peak 기준)
+            widened = round_to_tick(pos.peak_price * (1 - next_trail / 100))
+            pos.stop_price = widened
+            db.update_held_position(pos.ticker, trigger_price, widened, pos.phase)
+            bot_ui.schedule_message(
+                f"⚠️ <b>{pos.name}({pos.ticker})</b> 손절 {attempt}차 실패\n"
+                f"trail {trail:.0f}% → {next_trail:.0f}% 확대 재시도 중...",
+                throttle_key=f"sellfail_{pos.ticker}",
+            )
+            await asyncio.sleep(RETRY_WAIT_SEC)
+            trail = next_trail
+    return False
+
+
+async def _execute_sell_or_fallback(
+    pos: "TrailingPosition", price: float, reason: str, emoji: str,
+) -> bool:
+    """매도 트리거 처리. 자동 매도 성공 시 DB 정리 후 True, 실패/안전핀 시 pending_sell 폴백 후 False.
+
+    Returns:
+        True  — 매도 완료 (호출부에서 감시 목록 제거)
+        False — 수동 매도 대기 (pending_sell 마킹됨)
+    """
+    pnl_pct = (price / pos.entry_price - 1) * 100 if pos.entry_price > 0 else 0.0
+    sold = await _sell_with_retry(pos, price, reason)
+    if sold:
+        db.delete_held_position(pos.ticker)
+        bot_ui.schedule_message(
+            f"{emoji} <b>{pos.name}({pos.ticker})</b> {reason} 자동 매도 완료\n"
+            f"진입가 {pos.entry_price:,.0f} → 매도 {price:,.0f} ({pnl_pct:+.1f}%)",
+            throttle_key=f"sold_{pos.ticker}",
+        )
+        return True
+
+    pos.phase = 'pending_sell'
+    db.update_held_position(pos.ticker, price, pos.stop_price, 'pending_sell')
+    bot_ui.schedule_message(
+        f"{emoji} <b>{pos.name}({pos.ticker})</b> {reason} 라인 도달 — ⚠️ 자동 매도 보류/실패\n"
+        f"진입가 {pos.entry_price:,.0f} → 현재가 {price:,.0f} ({pnl_pct:+.1f}%)\n"
+        f"수동 매도 후 잔고 0 확인 시 자동 정리",
+        throttle_key=f"stop_{pos.ticker}",
+    )
+    return False
+
+
+async def _run_sell_task(
+    pos: "TrailingPosition", price: float, reason: str, emoji: str,
+    selling: set[str], sold: set[str],
+) -> None:
+    """매도 트리거를 백그라운드로 실행 (감시 루프 비블로킹).
+
+    매도 성공 시 ticker를 sold에 등록해 메인 루프가 pos_map에서 제거하게 한다.
+    완료 시 selling에서 해제하여 다음 트리거가 가능하도록 한다.
+    """
+    try:
+        if await _execute_sell_or_fallback(pos, price, reason, emoji):
+            sold.add(pos.ticker)
+    except Exception as e:
+        log.error("[%s] 매도 태스크 예외: %s", pos.ticker, e)
+    finally:
+        selling.discard(pos.ticker)
 
 
 async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
@@ -231,6 +355,10 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
     # 서버 재시작 시 이미 장 마감 이후면 알림 생략 (재시작마다 중복 전송 방지)
     close_notified = not is_market_hours() and _now_kst() >= MARKET_CLOSE
     tick = 0
+
+    # 비블로킹 매도 상태: 매도 진행 중(selling)/완료(sold) ticker 추적
+    _selling: set[str] = set()
+    _sold: set[str] = set()
 
     while True:
         # ── 1. 큐에서 신규 포지션 흡수 (동일 프로세스 즉시 주입) ──
@@ -310,9 +438,17 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
         if not pos_map:
             continue
 
+        # ── 3.5. 백그라운드 매도 완료분 정리 (pos_map 안전 제거) ──
+        if _sold:
+            for t in list(_sold):
+                ws.unsubscribe_ticker(t)
+                pos_map.pop(t, None)
+            log.info("매도 완료 정리: %s", list(_sold))
+            _sold.clear()
+
         # ── 4. 보유 종목 폴링 (WS 우선, HTTP 병렬 fallback) ──────
         to_remove: list[str] = []
-        tickers = list(pos_map.keys())
+        tickers = [t for t in pos_map.keys() if t not in _selling]  # 매도 진행 중 종목 제외
 
         # WS 캐시 우선, 없으면 HTTP 병렬 조회
         prices: dict[str, float] = {t: ws.get_ws_price(t) for t in tickers}
@@ -402,7 +538,7 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                                  ticker, price, old_stop, new_stop)
                     pos.peak_price = price
 
-                # ── 손절/익절 트리거 → pending_sell 대기 ────────
+                # ── 손절/익절 트리거 → 자동 매도 (실패/안전핀 시 수동 폴백) ──
                 if price <= pos.stop_price and _check_gap_down_buffer(pos, price):
                     continue  # W3: 갭다운 버퍼 대기 중
                 if price <= pos.stop_price:
@@ -411,19 +547,14 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                     reason = "익절" if prev_phase == 'trail' else ("본전회수" if prev_phase == 'even' else "손절")
                     emoji = "🟡" if prev_phase == 'trail' else ("🟠" if prev_phase == 'even' else "🔴")
                     log.warning(
-                        "[%s] %s 트리거 — 현재가=%.0f ≤ stop=%.0f (P&L=%.1f%%) → pending_sell",
+                        "[%s] %s 트리거 — 현재가=%.0f ≤ stop=%.0f (P&L=%.1f%%) → 자동 매도 시도",
                         ticker, reason, price, pos.stop_price, pnl_pct,
                     )
-                    pos.phase = 'pending_sell'
-                    db.update_held_position(ticker, price, pos.stop_price, 'pending_sell')
-                    bot_ui.schedule_message(
-                        f"{emoji} *{pos.name}({ticker})* {reason} 라인 도달\n"
-                        f"진입가 {pos.entry_price:,.0f} → 현재가 {price:,.0f} ({pnl_pct:+.1f}%)\n"
-                        f"⚠️ 수동 매도 후 잔고 0 확인 시 자동 정리",
-                        throttle_key=f"stop_{ticker}",
-                    )
+                    # 비블로킹: 매도(최대 3회 재시도)를 백그라운드로 분리해 다른 종목 감시 지속
+                    _selling.add(ticker)
+                    asyncio.create_task(_run_sell_task(pos, price, reason, emoji, _selling, _sold))
 
-                # ── 시간 제한 손절 (Time Stop): 5일 경과 & 수익 < 1% ────
+                # ── 시간 제한 손절 (Time Stop): TIME_STOP_DAYS 경과 & 수익 ≤ 임계값 ──
                 else:
                     e_date = datetime.strptime(pos.entry_date, "%Y-%m-%d").date()
                     days_held = (datetime.now(KST).date() - e_date).days
@@ -431,16 +562,10 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
 
                     if days_held >= TIME_STOP_DAYS and profit_pct <= TIME_STOP_THRESHOLD_PCT:
                         reason = "시간해제 (Time Stop)"
-                        log.warning("[%s] %d일 경과 수익률 %.1f%% 저조 — %s 트리거 → pending_sell",
+                        log.warning("[%s] %d일 경과 수익률 %.1f%% 저조 — %s 트리거 → 자동 매도 시도",
                                     ticker, days_held, profit_pct, reason)
-                        pos.phase = 'pending_sell'
-                        db.update_held_position(ticker, price, pos.stop_price, 'pending_sell')
-                        bot_ui.schedule_message(
-                            f"⏳ *{pos.name}({ticker})* {reason} 라인 도달\n"
-                            f"보유일: {days_held}일 | 수익률: {profit_pct:+.1f}%\n"
-                            f"⚠️ 수동 매도 후 잔고 0 확인 시 자동 정리",
-                            throttle_key=f"stop_{ticker}",
-                        )
+                        _selling.add(ticker)
+                        asyncio.create_task(_run_sell_task(pos, price, reason, "⏳", _selling, _sold))
             except Exception as e:
                 log.error("[%s] 감시 중 예외 발생: %s", ticker, e)
 

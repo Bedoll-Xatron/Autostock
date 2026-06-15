@@ -74,6 +74,11 @@ async def run_daily_kpi_report() -> None:
         sector_str = " / ".join(f"{s} {c}" for s, c in sector_counts.items())
         position_line = f"\n현재 보유: {len(held)}종목 ({sector_str})"
 
+    # L8: 모의투자는 체결/슬리피지가 이상적이라 지표가 낙관 편향됨 — 주의 문구
+    sim_note = ""
+    if bot_ui.get_kis_simulated():
+        sim_note = "\n\n⚠️ _모의투자: 체결가·슬리피지가 실제보다 낙관적입니다. 지표는 참고용._"
+
     msg = (
         f"📊 *일일 KPI 리포트* — {today}\n\n"
         f"매수 실행: {len(buy_rows)}건 (차단 {len(blocked)}건){blocked_detail}\n"
@@ -82,6 +87,7 @@ async def run_daily_kpi_report() -> None:
         f"평균 슬리피지: {avg_slip:+.2f}%"
         f"{gate_block_detail}"
         f"{position_line}"
+        f"{sim_note}"
     )
     bot_ui.schedule_message(msg)
     log.info("KPI 리포트 발송: %s", today)

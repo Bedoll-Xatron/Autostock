@@ -37,6 +37,7 @@ PID_FILE = BASE_DIR / "logs" / "server.pid"
 DAEMON_PID_FILE = BASE_DIR / "logs" / "daemon.pid"
 STOP_SENTINEL = BASE_DIR / "logs" / ".stop"
 LOG_FILE = BASE_DIR / "logs" / "server.log"
+SERVE_LOCK_FILE = BASE_DIR / "logs" / "serve.lock"
 
 
 # ── 프로세스 관리 헬퍼 ──────────────────────────────────────────
@@ -55,6 +56,25 @@ def _is_running(pid: int) -> bool:
         capture_output=True, shell=True,
     )
     return "python.exe" in r.stdout.decode("cp949", errors="replace")
+
+
+def _acquire_single_instance_lock() -> bool:
+    """단일 serve 인스턴스 보장. 살아있는 다른 serve가 있으면 False(=기동 중단).
+
+    PM2와 자체 실행이 겹쳐도 두 번째 프로세스가 스스로 종료해 이중 매매를 막는다.
+    """
+    try:
+        if SERVE_LOCK_FILE.exists():
+            old = SERVE_LOCK_FILE.read_text(encoding="utf-8").strip()
+            if old.isdigit() and int(old) != os.getpid() and _is_running(int(old)):
+                log.error("이미 실행 중인 serve(PID %s) 감지 — 중복 기동 차단", old)
+                return False
+        SERVE_LOCK_FILE.parent.mkdir(exist_ok=True)
+        SERVE_LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except Exception as e:
+        log.warning("단일 인스턴스 락 처리 실패(무시하고 진행): %s", e)
+        return True
 
 
 def _find_all_main_pids() -> list[int]:
@@ -132,16 +152,25 @@ def _stop() -> None:
 
 
 def _status() -> None:
-    if not PID_FILE.exists():
-        print("[status] 서버 중지 상태")
+    # PM2 환경: serve.lock(현재 serve PID)을 우선 확인. 없으면 구 server.pid 폴백.
+    lock_pid = None
+    if SERVE_LOCK_FILE.exists():
+        txt = SERVE_LOCK_FILE.read_text(encoding="utf-8").strip()
+        if txt.isdigit():
+            lock_pid = int(txt)
+    if lock_pid is None and PID_FILE.exists():
+        txt = PID_FILE.read_text().strip()
+        if txt.isdigit():
+            lock_pid = int(txt)
+
+    if lock_pid is None:
+        print("[status] 서버 중지 상태 (lock 없음)")
         return
-    pid = int(PID_FILE.read_text().strip())
-    if _is_running(pid):
-        print(f"[status] 실행 중 - PID {pid}")
+    if _is_running(lock_pid):
+        print(f"[status] 실행 중 - serve PID {lock_pid}")
         _tail_log(5)
     else:
-        print(f"[status] PID {pid} 비정상 종료")
-        PID_FILE.unlink(missing_ok=True)
+        print(f"[status] PID {lock_pid} 비정상 종료(잔존 lock)")
 
 
 def _run_daemon() -> None:
@@ -241,6 +270,9 @@ async def _run_fastapi() -> None:
 
 
 async def _serve() -> None:
+    if not _acquire_single_instance_lock():
+        log.error("중복 serve 기동 차단 — 즉시 종료 (이중 매매 방지)")
+        return
     log.info("bedoll AutoStock 시작")
     log.info("KIS 모드: %s", "모의투자" if config.KIS_SIMULATED_MODE else "실거래")
     log.info("REVIEW_COUNT: %d", config.REVIEW_COUNT)
@@ -304,19 +336,22 @@ def main() -> None:
 
     if args.serve:
         asyncio.run(_serve())
-    elif args.daemon:
-        _run_daemon()
     elif args.status:
         _status()
     elif args.stop:
         _stop()
+    elif args.daemon:
+        # 자체 데몬은 PM2와 충돌(이중 감독자)하므로 봉인됨
+        print("[deprecated] 자체 데몬은 PM2와 충돌하여 비활성화되었습니다.\n"
+              "  서버 관리는 PM2를 사용하세요: pm2 start ecosystem.config.json")
     elif args.restart:
-        _stop()
-        time.sleep(1)
-        _start_background()
+        print("[info] 서버는 PM2가 관리합니다. 재시작: pm2 restart autostock")
     else:
-        # 기본: 백그라운드로 시작
-        _start_background()
+        print("[info] 서버는 PM2가 관리합니다.\n"
+              "  시작/재시작 : pm2 restart autostock  (최초 등록: pm2 start ecosystem.config.json)\n"
+              "  중지        : pm2 stop autostock\n"
+              "  상태        : python main.py --status\n"
+              "  직접 실행(포그라운드, 디버그용): python main.py --serve")
 
 
 if __name__ == "__main__":

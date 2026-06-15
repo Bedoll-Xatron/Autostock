@@ -7,7 +7,7 @@ import pytz
 from autostock import config
 from autostock.db import supabase as db
 from autostock.market.kr_holidays import is_market_hours
-from autostock.trading.kis_client import get_quote_detail, get_available_cash, get_volume_rank, place_order
+from autostock.trading.kis_client import get_quote_detail, get_available_cash, get_volume_rank, place_order, get_all_holdings
 from autostock.trading.trailing_stop import TrailingPosition, add_positions, _fixed_stop, liberate_capital
 from autostock.trading.executor import calc_order_qty, execute_decisions
 from autostock.hitl import hitl_state, telegram_bot as bot_ui
@@ -92,16 +92,27 @@ async def run_fast_track_pipeline(ticker: str, name: str, current_price: float):
         try:
             # 시장가 매수
             place_order(ticker, "BUY", qty, 0)
-            
+
+            # 실제 체결 평균가 조회 (시장가 체결 반영, 실패 시 current_price 폴백)
+            entry = current_price
+            try:
+                await asyncio.sleep(1.5)  # 체결 반영 대기
+                for h in await asyncio.to_thread(get_all_holdings):
+                    if h["ticker"] == ticker and h.get("avg_price", 0) > 0:
+                        entry = float(h["avg_price"])
+                        break
+            except Exception as e:
+                log.warning("[%s] 체결 평균가 조회 실패 — current_price 사용: %s", ticker, e)
+
             # 매수 성공 시 Trailing Stop 감시 큐에 추가 및 DB 저장
             pos = TrailingPosition(
                 ticker=ticker,
                 name=name,
                 qty=qty,
-                avg_price=current_price,  # 시장가 체결이라 정확하지 않을 수 있으나 현재가로 임시 기록
-                entry_price=current_price,
-                stop_price=_fixed_stop(current_price),
-                peak_price=current_price,
+                avg_price=entry,
+                entry_price=entry,
+                stop_price=_fixed_stop(entry),
+                peak_price=entry,
                 phase='stop',
             )
             add_positions([pos])
@@ -124,7 +135,7 @@ async def run_fast_track_pipeline(ticker: str, name: str, current_price: float):
                 f"▪ AI 신뢰도: {d.confidence}점\n"
                 f"▪ 이유: {d.final_reason}\n"
                 f"▪ 매수 수량: {qty}주 (예수금의 30% 배정)\n"
-                f"▪ 감시가: {current_price:,.0f}원 (자동 트레일링 스탑 적용됨)"
+                f"▪ 체결 평균가: {entry:,.0f}원 (자동 트레일링 스탑 적용됨)"
             )
             bot_ui.schedule_message(msg)
             

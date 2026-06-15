@@ -1,10 +1,11 @@
 """매매 주문 실행 — 수량 계산 및 KIS 주문."""
+import asyncio
 import os
 
 from autostock import config
 from autostock.models import FinalDecision
-from autostock.trading.kis_client import get_available_cash, get_holding_qty, place_order, get_current_price
-from autostock.trading.limit_order import limit_buy_with_timeout
+from autostock.trading.kis_client import get_available_cash, get_holding_qty, get_current_price, market_sell
+from autostock.trading.limit_order import limit_buy_with_timeout, limit_buy_with_pullback
 from autostock.trading.entry_gates import check_entry_gates
 from autostock.db import supabase as db
 from autostock.hitl import telegram_bot as bot_ui
@@ -145,10 +146,13 @@ async def execute_decisions(
         log.info("일일 신규 진입 누적: 오늘 이미 %d건 체결 — 잔여 한도 %d",
                  _new_count, max(0, DAILY_NEW_ENTRY_LIMIT - _new_count))
 
+    # ── Pass 1: 게이트·수량 계획 (주문 실행 없음, 순차) ─────────
+    # 매수 주문은 눌림 대기로 종목당 최대 30분 블로킹될 수 있어, 계획을 먼저
+    # 세운 뒤 Pass 2에서 병렬 실행한다. (순차 실행 시 첫 종목 이후가 09:45 창을
+    # 놓치는 기아 버그 방지)
+    plans: list[dict] = []
     for d in decisions:
         qty = 0
-        fill_price = 0
-        order_result = None
         blocked_reason = None
         gap_pct = 0.0
         open_price = 0.0
@@ -206,23 +210,67 @@ async def execute_decisions(
             elif d.action == "SELL":
                 qty = get_holding_qty(d.ticker)
 
-            if qty > 0:
-                try:
-                    if d.action == "BUY":
-                        # 정보 전용 모드: 실제 매수 금지
-                        order_result = {"filled": False, "info_only": True, "message": "매수 추천 알림 (실행 안함)"}
-                        log.info("execute_decisions: %s BUY 추천됨 (시스템 매수 차단)", d.ticker)
-                    else:
-                        # 정보 전용 모드: 실제 매도 금지
-                        order_result = {"info_only": True, "message": "매도 추천 알림 (실행 안함)"}
-                        log.info("execute_decisions: %s SELL 추천됨 (시스템 매도 차단)", d.ticker)
-                except Exception as e:
-                    log.error("execute_decisions: %s order mock failed — %s", d.ticker, e)
-                    order_result = {"error": str(e)}
+        # 매수 시도 종목은 후속 결정의 한도 게이트를 위해 계획 시점에 카운트
         if d.action == "BUY" and qty > 0:
             _sec = w_info.get("sector", "Unknown")
             _sector_count[_sec] = _sector_count.get(_sec, 0) + 1
             _new_count += 1
+
+        plans.append({
+            "d": d,
+            "w_info": w_info,
+            "qty": qty,
+            "fill_price": 0,
+            "order_result": None,
+            "blocked_reason": blocked_reason,
+            "gap_pct": gap_pct,
+            "open_price": open_price,
+        })
+
+    # ── Pass 2: 매수 주문 병렬 실행 (눌림 대기 기아 방지) ────────
+    entry_mode = os.getenv("ENTRY_MODE", "pullback")
+    buy_fn = limit_buy_with_pullback if entry_mode == "pullback" else limit_buy_with_timeout
+    buy_plans = [p for p in plans if p["d"].action == "BUY" and p["qty"] > 0]
+    if buy_plans:
+        log.info("매수 주문 %d종목 병렬 실행 (mode=%s)", len(buy_plans), entry_mode)
+        buy_results = await asyncio.gather(
+            *(buy_fn(p["d"].ticker, p["qty"], p["d"].price_reference) for p in buy_plans),
+            return_exceptions=True,
+        )
+        for p, r in zip(buy_plans, buy_results):
+            if isinstance(r, Exception):
+                log.error("[%s] 매수 주문 예외: %s", p["d"].ticker, r)
+                p["order_result"] = {"filled": False, "error": str(r)}
+                p["qty"] = 0
+            else:
+                filled_qty, fill_price = r
+                # 실제 체결 수량으로 반영 (부분 체결 잔량 미추적 방지)
+                p["qty"] = filled_qty
+                p["order_result"] = {"filled": filled_qty > 0}
+                if filled_qty > 0:
+                    p["fill_price"] = fill_price
+
+    # ── Pass 2b: 매도 주문 (시장가, 즉시) ───────────────────────
+    for p in plans:
+        if p["d"].action == "SELL" and p["qty"] > 0:
+            try:
+                market_sell(p["d"].ticker, p["qty"])
+                p["order_result"] = {"filled": True}
+            except Exception as e:
+                log.error("[%s] SELL 실패: %s", p["d"].ticker, e)
+                p["order_result"] = {"filled": False, "error": str(e)}
+                p["qty"] = 0
+
+    # ── Pass 3: Supabase 저장 + 결과 집계 ───────────────────────
+    for p in plans:
+        d = p["d"]
+        w_info = p["w_info"]
+        qty = p["qty"]
+        fill_price = p["fill_price"]
+        order_result = p["order_result"]
+        blocked_reason = p["blocked_reason"]
+        gap_pct = p["gap_pct"]
+        open_price = p["open_price"]
 
         tech  = _model_to_dict(tech_reports.get(d.ticker))
         fund  = _model_to_dict(fund_reports.get(d.ticker))

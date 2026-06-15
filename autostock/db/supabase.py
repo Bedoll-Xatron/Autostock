@@ -161,7 +161,7 @@ def fetch_executed_buys_between(start: str, end: str) -> list[dict]:
         res = (
             get_client()
             .table("trading_decisions")
-            .select("ticker, date, price_reference")
+            .select("ticker, date, price_reference, open_price, entry_slippage_pct")
             .gte("date", start)
             .lte("date", end)
             .eq("action", "BUY")
