@@ -45,59 +45,64 @@ class TestRRatio:
         source = inspect.getsource(executor)
         assert "_R_RATIO = 0.01" not in source, "executor.py에 0.01 하드코딩이 남아 있음"
 
-    def test_calc_order_qty_uses_config_r_ratio(self):
-        """calc_order_qty가 config.R_RATIO(0.5%)를 사용해 수량을 계산하는지 확인."""
+    def test_calc_order_qty_uses_atr_and_r_ratio(self):
+        """calc_order_qty가 R_RATIO(0.5%)와 ATR 손절폭으로 수량 계산 (LLM 신뢰도 미반영)."""
+        from unittest.mock import patch
         from autostock import config
-        from autostock.trading.executor import calc_order_qty
+        from autostock.trading import executor
+        from autostock.trading.executor import calc_order_qty, SINGLE_POSITION_CAP_PCT
         from autostock.models import FinalDecision
 
         decision = FinalDecision(
-            ticker="005930",
-            action="BUY",
-            confidence=9.0,
-            final_reason="테스트",
-            price_reference=50000.0,
-            stop_loss_price=46000.0,
-            bull_summary="",
-            bear_summary="",
+            ticker="005930", action="BUY", confidence=9.0, final_reason="테스트",
+            price_reference=50000.0, stop_loss_price=46000.0, bull_summary="", bear_summary="",
         )
         available_cash = 10_000_000.0
 
-        qty = calc_order_qty(decision, available_cash)
+        with patch.object(executor, "compute_stop_pct", return_value=4.0):
+            qty = calc_order_qty(decision, available_cash)
 
-        stop_loss_pct = (50000 - 46000) / 50000  # 8%
-        r_multiplier = 1.5  # confidence 9 → 1.5x
-        risk_amount = available_cash * config.R_RATIO * r_multiplier
-        position_size = min(risk_amount / stop_loss_pct, available_cash * 0.5)
+        risk_amount = available_cash * config.R_RATIO  # 신뢰도 배수 없음
+        position_size = min(risk_amount / 0.04, available_cash * SINGLE_POSITION_CAP_PCT)
         expected_qty = int(position_size / 50000)
+        assert qty == expected_qty, f"예상 {expected_qty}, 실제 {qty}"
 
-        assert qty == expected_qty, f"예상 수량 {expected_qty}, 실제 {qty}"
+    def test_calc_order_qty_ignores_llm_confidence(self):
+        """confidence가 달라도 수량이 동일 — 사이징이 LLM에서 분리됨."""
+        from unittest.mock import patch
+        from autostock.trading import executor
+        from autostock.trading.executor import calc_order_qty
+        from autostock.models import FinalDecision
+
+        def _mk(conf):
+            return FinalDecision(
+                ticker="005930", action="BUY", confidence=conf, final_reason="t",
+                price_reference=50000.0, stop_loss_price=46000.0, bull_summary="", bear_summary="",
+            )
+        with patch.object(executor, "compute_stop_pct", return_value=4.0):
+            q_hi = calc_order_qty(_mk(9.0), 10_000_000.0)
+            q_lo = calc_order_qty(_mk(5.0), 10_000_000.0)
+        assert q_hi == q_lo
 
     def test_calc_order_qty_fallback_uses_config_stop_loss(self):
-        """stop_loss_price 없을 때 config.STOP_LOSS_PCT(8%) 사용하는지 확인."""
+        """compute_stop_pct 실패(0) 시 config.STOP_LOSS_PCT 폴백."""
+        from unittest.mock import patch
         from autostock import config
-        from autostock.trading.executor import calc_order_qty
+        from autostock.trading import executor
+        from autostock.trading.executor import calc_order_qty, SINGLE_POSITION_CAP_PCT
         from autostock.models import FinalDecision
 
         decision = FinalDecision(
-            ticker="005930",
-            action="BUY",
-            confidence=7.0,
-            final_reason="테스트",
-            price_reference=50000.0,
-            stop_loss_price=0.0,  # 없는 경우
-            bull_summary="",
-            bear_summary="",
+            ticker="005930", action="BUY", confidence=7.0, final_reason="테스트",
+            price_reference=50000.0, stop_loss_price=0.0, bull_summary="", bear_summary="",
         )
         available_cash = 10_000_000.0
-        qty = calc_order_qty(decision, available_cash)
+        with patch.object(executor, "compute_stop_pct", return_value=0.0):
+            qty = calc_order_qty(decision, available_cash)
 
-        # 8% 손절로 계산되어야 함
-        r_multiplier = 1.0  # confidence 7 → 1.0x
-        risk_amount = available_cash * config.R_RATIO * r_multiplier
-        position_size = min(risk_amount / config.STOP_LOSS_PCT, available_cash * 0.5)
+        risk_amount = available_cash * config.R_RATIO
+        position_size = min(risk_amount / config.STOP_LOSS_PCT, available_cash * SINGLE_POSITION_CAP_PCT)
         expected_qty = int(position_size / 50000)
-
         assert qty == expected_qty
 
 

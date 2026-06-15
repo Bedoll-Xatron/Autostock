@@ -31,11 +31,11 @@ class SignalConfig:
     min_total_score_b: int = 9           # B등급 총점 최소
     min_quality_b: float = 40.0          # B등급 품질 최소
 
-    # 포지션 사이징
-    r_ratio: float = 0.005               # 자본 대비 기본 R 비율 (0.5%)
-    stop_loss_pct: float = 0.08          # 손절 비율 (8%) — 백테스트 실손절 패턴 반영
-    take_profit_pct: float = 0.15        # 익절 비율 (15%)
-    max_position_pct: float = 0.50       # 최대 포지션 비율 (50%)
+    # 포지션 사이징 (스캔 표기용 — 실제 주문 크기는 autostock executor.calc_order_qty가 ATR로 결정)
+    r_ratio: float = 0.005               # 자본 대비 기본 R 비율 (0.5%) — 라이브와 동일
+    stop_loss_pct: float = 0.08          # 표기용 손절 비율 (라이브는 ATR 기반)
+    take_profit_pct: float = 0.15        # 표기용 익절 비율
+    max_position_pct: float = 0.15       # 최대 포지션 비율 — 라이브 단일 캡(15%)과 일원화
 
     # 등급별 설정
     grade_configs: Dict[Grade, GradeConfig] = field(default_factory=lambda: {

@@ -7,6 +7,7 @@ from autostock.models import FinalDecision
 from autostock.trading.kis_client import get_available_cash, get_holding_qty, get_current_price, market_sell
 from autostock.trading.limit_order import limit_buy_with_timeout, limit_buy_with_pullback
 from autostock.trading.entry_gates import check_entry_gates
+from autostock.trading.risk import compute_stop_pct
 from autostock.db import supabase as db
 from autostock.hitl import telegram_bot as bot_ui
 from autostock.logger import get_logger
@@ -20,13 +21,6 @@ SINGLE_POSITION_CAP_PCT = 0.10 if not config.KIS_SIMULATED_MODE else 0.15
 SECTOR_LIMIT            = 2
 DAILY_NEW_ENTRY_LIMIT   = 2    if not config.KIS_SIMULATED_MODE else 3
 TOTAL_HOLDING_LIMIT     = 5    if not config.KIS_SIMULATED_MODE else 7
-
-
-_R_MULTIPLIER_TIERS: list[tuple[float, float]] = [
-    (9.0, 1.5),
-    (7.0, 1.0),
-    (5.0, 0.5),
-]
 
 
 def _check_position_limits(
@@ -55,44 +49,34 @@ def calc_order_qty(
     position_scale: float = 1.0,
 ) -> int:
     """
-    R 기반 매수 수량 계산.
+    변동성(ATR) 단독 포지션 사이징 — LLM confidence는 사이징에 미반영.
 
-    risk_amount = (available_cash * R_RATIO) * r_multiplier * position_scale
-    position_size = risk_amount / stop_loss_pct
-    max = available_cash * 50%
+    매수 여부는 supervisor의 buy_threshold가 게이트하고, 크기는 오직 리스크로 결정:
+        risk_amount   = available_cash * R_RATIO(0.5%) * position_scale
+        stop_loss_pct = ATR 기반(compute_stop_pct, 종목별 2.5~6%)
+        position_size = risk_amount / stop_loss_pct   (단일 포지션 캡 적용)
     """
     if decision.action != "BUY":
         return 0
 
-    r_multiplier = 0.0
-    for threshold, mult in _R_MULTIPLIER_TIERS:
-        if decision.confidence >= threshold:
-            r_multiplier = mult
-            break
-
-    if r_multiplier == 0:
-        log.info("calc_order_qty: %s 신뢰도 미달(%.1f) — 매매 보류", decision.ticker, decision.confidence)
+    entry = decision.price_reference or 0.0
+    if entry <= 0 or available_cash <= 0:
         return 0
 
-    entry = decision.price_reference or 0.0
-    stop = decision.stop_loss_price or 0.0
-    if entry > 0 and 0 < stop < entry:
-        stop_loss_pct = (entry - stop) / entry
-    else:
-        stop_loss_pct = config.STOP_LOSS_PCT  # config.py 단일 정의 (기본 8%)
+    # ATR 기반 손절폭 (트레일링 초기 손절과 동일 기준으로 일관성 확보)
+    stop_loss_pct = compute_stop_pct(decision.ticker) / 100.0
+    if stop_loss_pct <= 0:
+        stop_loss_pct = config.STOP_LOSS_PCT
 
-    risk_amount = available_cash * config.R_RATIO * r_multiplier * position_scale
+    # 고정 리스크(0.5R). 검증되지 않은 LLM 신뢰도로 베팅 크기를 키우지 않는다.
+    risk_amount = available_cash * config.R_RATIO * position_scale
     position_size = risk_amount / stop_loss_pct
     position_size = min(position_size, available_cash * SINGLE_POSITION_CAP_PCT)
 
-    if entry <= 0:
-        return 0
-
     qty = int(position_size / entry)
     log.info(
-        "calc_order_qty: %s confidence=%.1f r_mult=%.1fx scale=%.1f stop=%.1f%% size=%.0f qty=%d",
-        decision.ticker, decision.confidence, r_multiplier, position_scale,
-        stop_loss_pct * 100, position_size, qty,
+        "calc_order_qty: %s ATR손절=%.1f%% scale=%.1f size=%.0f qty=%d (LLM신뢰도 미반영)",
+        decision.ticker, stop_loss_pct * 100, position_scale, position_size, qty,
     )
     return max(0, qty)
 

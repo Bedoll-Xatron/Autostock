@@ -48,11 +48,11 @@ def _make_final_decisions(state: TradingState) -> dict:
             f"Bear(점수:{bear.bear_score if bear else 'N/A'}): {bear.bear_summary if bear else 'N/A'}\n"
         )
 
-    buy_threshold = 5 if config.KIS_SIMULATED_MODE else 7
+    # 모의/실거래 동일 7점 — 과매매가 손실의 원인이었으므로 모의 공격성(5→7) 하향(사용자 승인)
+    buy_threshold = 7
     mode_hint = (
-        f"모의투자 모드: confidence {buy_threshold}점 이상이면 BUY 적극 권장 (백테스트 데이터 수집 목적)"
-        if config.KIS_SIMULATED_MODE else
-        f"실거래 모드: confidence {buy_threshold}점 이상일 때만 BUY"
+        f"confidence {buy_threshold}점 이상이고 bull_score > bear_score일 때만 BUY. "
+        "신뢰도가 애매하면 HOLD하여 저품질 신호 남발을 피하세요."
     )
     system = SystemMessage(content=(
         "당신은 포트폴리오 매니저(CIO)입니다. "

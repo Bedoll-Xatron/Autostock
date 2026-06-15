@@ -1,20 +1,20 @@
 """
 트레일링 손절 감시 — asyncio background task.
 
-3단계 손절 전략:
-  Phase 1 (stop): 진입가 대비 ATR 기반 손절선 (종목별 2.5~6%, 기본 3%), +2% 미만 구간에서 유지
-  Phase 2 (even): +2% 도달 시 손절가를 진입가(본전)로 1회 인상
-  Phase 3 (trail): +5% 돌파 시 peak 기준 2.5% trailing 활성화
+손절/익절 전략 (손익비 우선 — ATR 손절 + 부분익절 + 광폭 트레일):
+  Phase 1 (stop): 진입가 대비 ATR 기반 손절선 (종목별 2.5~6%, 기본 3%). 본전 이동 없음.
+  +1R 도달(=stop_pct% 상승): 보유의 1/3 부분 익절 확정 → Phase 2(trail) 전환
+  Phase 2 (trail): 잔량은 peak 기준 광폭 트레일(= stop_pct × 2 ≈ ATR×3)로 winner를 끝까지 추종
 
-  결과: 손실은 최대 -3%로 제한, +2%+ 도달 시 본전 보호, 수익은 5~9%+ 구간에서 실현
+  설계 의도: 손절은 변동성 밖에 두어 노이즈 청산 최소화, +1R에서 일부 확정,
+            나머지는 광폭 트레일로 큰 수익을 잡아 손익비(평균수익/평균손실) ≥ 2.5:1 지향
 
 동작 규칙:
   - 장 시간(09:00~15:20) 에만 폴링 (30초 간격)
-  - Phase 1: price <= entry × 0.97 → 손절 매도
-  - Phase 2 진입: price >= entry × 1.02 → stop = entry (본전으로 인상)
-  - Phase 3 진입: price >= entry × 1.05 → trailing 활성화 (stop/even 양쪽에서 직행 가능)
-  - Phase 3: price > peak → peak 갱신, stop = peak × (1 - PROFIT_TRAIL_PCT)
-             price <= stop → 익절 매도
+  - Phase 1: price <= stop(ATR) → 전량 손절 매도
+  - +1R 도달: 1/3 시장가 부분 익절 → trail 전환
+  - Phase 2(trail): price > peak → peak 갱신, stop = max(stop, peak × (1 - trail_pct))
+             price <= stop → 잔량 익절 매도
   - 매도 실패 시 trail 폭을 3 → 5 → 7%로 확대하며 최대 3회 재시도 후 텔레그램 알림
   - 15:20 KST 이후 → 잔여 종목 held_positions 저장 (루프는 유지, 다음 날 재개)
   - 서버 재시작 시 held_positions 로드 → 감시 재개
@@ -44,16 +44,16 @@ KST = pytz.timezone("Asia/Seoul")
 POLL_INTERVAL = 30              # 초
 DB_RESYNC_INTERVAL = 10         # DB 재동기화 주기 (10 × 30s = 5분)
 
-STOP_LOSS_PCT       = 3.0       # 진입가 대비 고정 손절 (%)
-BREAKEVEN_TRIGGER_PCT = 2.0     # 본전 보호 활성화 기준 수익률 (%)
-PROFIT_TRIGGER_PCT  = 5.0       # trailing 활성화 기준 수익률 (%)
-PROFIT_TRAIL_PCT    = 2.5       # trailing 활성화 후 peak 대비 trail (%)
+STOP_LOSS_PCT       = 3.0       # ATR 산출 실패 시 폴백 손절 (%)
+PARTIAL_TRIGGER_R   = 1.0       # +1R(=stop_pct%) 도달 시 부분 익절
+PARTIAL_FRACTION    = 1.0 / 3   # 부분 익절 비중 (1/3)
+TRAIL_MULT          = 2.0       # 트레일 폭 = stop_pct × 2 (≈ ATR×3, stop=ATR×1.5 기준)
+TRAIL_MULT_FAST     = 1.0       # fast mode 트레일 폭 = stop_pct × 1 (급락 시 빡빡하게)
 SELL_RETRY_TRAIL_START = 3.0    # 매도 실패 시 1차 trail 폭 (%)
 SELL_RETRY_TRAIL_STEP  = 2.0    # 실패할 때마다 확대 폭 → 3 → 5 → 7
 SELL_RETRY_TRAIL_MAX   = 7.0    # 최대 trail 폭 (3차 재시도)
 RETRY_WAIT_SEC      = 10        # 재시도 대기 (초)
 
-FAST_TRAIL_PCT        = 4.0     # fast mode trail (%) → 3, 7, 11% 구간
 FAST_POLL_INTERVAL    = 10      # fast mode 폴링 간격 (초)
 VELOCITY_DROP_TRIGGER = -2.0    # 단일 poll 낙폭 (%) — fast mode 진입
 VELOCITY_HISTORY_LEN  = 4       # 연속 하락 검출 히스토리 길이
@@ -100,7 +100,7 @@ class TrailingPosition:
     stop_price:  float          # 현재 적용 손절가
     peak_price:  float          # 감시 중 최고가
     stop_pct:     float = 3.0    # 종목별 ATR 손절폭 (%)
-    phase:        str  = 'stop'  # 'stop' | 'even' | 'trail'
+    phase:        str  = 'stop'  # 'stop'(초기) | 'trail'(부분익절 후) | 'pending_sell'
     entry_date:   str  = field(default_factory=lambda: datetime.now().strftime('%Y-%m-%d'))
     fast_mode:    bool = field(default=False)
     price_history: list = field(default_factory=list)
@@ -130,10 +130,17 @@ def _fixed_stop(entry: float, stop_pct: float = STOP_LOSS_PCT) -> int:
     return round_to_tick(entry * (1 - stop_pct / 100))
 
 
-def _trail_stop(peak: float, fast: bool = False) -> int:
+def _trail_stop(peak: float, stop_pct: float = STOP_LOSS_PCT, fast: bool = False) -> int:
+    """광폭 트레일 손절가. trail 폭 = stop_pct × (fast면 1, 아니면 2) ≈ ATR×3."""
     from autostock.trading.kis_client import round_to_tick
-    pct = FAST_TRAIL_PCT if fast else PROFIT_TRAIL_PCT
-    return round_to_tick(peak * (1 - pct / 100))
+    mult = TRAIL_MULT_FAST if fast else TRAIL_MULT
+    return round_to_tick(peak * (1 - (stop_pct * mult) / 100))
+
+
+def _load_phase(row: dict) -> str:
+    """DB 로드 시 레거시 'even' 페이즈를 'stop'으로 정규화 (신모델은 stop/trail만 사용)."""
+    p = row.get("phase", "stop")
+    return "stop" if p == "even" else p
 
 
 def _detect_velocity(pos: "TrailingPosition", price: float) -> bool:
@@ -322,6 +329,47 @@ async def _run_sell_task(
         selling.discard(pos.ticker)
 
 
+async def _take_partial_task(pos: "TrailingPosition", price: float, partialing: set[str]) -> None:
+    """+1R 도달 시 1/3 부분 익절 후 trail 전환 (백그라운드, 비블로킹).
+
+    실거래 안전핀 미해제/수량 부족이면 부분 매도는 건너뛰고 trail 전환만 수행.
+    매도 주문 실패 시 phase를 'stop'으로 두어 다음 폴에서 재시도.
+    """
+    try:
+        allowed, _mode = _auto_sell_allowed()
+        sold_qty = 0
+        if allowed:
+            sell_qty = int(pos.qty * PARTIAL_FRACTION)
+            if sell_qty >= 1:
+                held = await asyncio.to_thread(get_holding_qty, pos.ticker)
+                sell_qty = min(sell_qty, held)
+                if sell_qty >= 1:
+                    await asyncio.to_thread(market_sell, pos.ticker, sell_qty)
+                    pos.qty -= sell_qty
+                    sold_qty = sell_qty
+
+        # 부분 매도 성공/생략과 무관하게 trail 전환 (winner 추종 시작)
+        pos.phase = 'trail'
+        pos.peak_price = max(pos.peak_price, price)
+        new_stop = _trail_stop(pos.peak_price, pos.stop_pct, pos.fast_mode)
+        pos.stop_price = max(pos.stop_price, new_stop)
+        db.save_held_position(pos.to_dict())
+
+        pnl = (price / pos.entry_price - 1) * 100 if pos.entry_price > 0 else 0.0
+        if sold_qty > 0:
+            bot_ui.schedule_message(
+                f"💰 <b>{pos.name}({pos.ticker})</b> +1R 부분익절 {sold_qty}주 확정 (+{pnl:.1f}%)\n"
+                f"잔량 {pos.qty}주 → 트레일 전환 (stop {pos.stop_price:,.0f})",
+                throttle_key=f"partial_{pos.ticker}",
+            )
+        else:
+            log.info("[%s] +1R 도달 — 부분익절 생략(안전핀/수량) → 트레일 전환", pos.ticker)
+    except Exception as e:
+        log.error("[%s] 부분익절 실패(다음 폴 재시도): %s", pos.ticker, e)
+    finally:
+        partialing.discard(pos.ticker)
+
+
 async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
     """
     단일 장기 실행 감시 루프.
@@ -345,9 +393,7 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                 bot_ui.schedule_message(msg)
             asyncio.create_task(_notify_watch_start(
                 f"📈 손절 감시 시작 — {names_str}\n"
-                f"손절: 진입가 -{STOP_LOSS_PCT:.0f}% | "
-                f"+{BREAKEVEN_TRIGGER_PCT:.0f}% 본전 보호 | "
-                f"+{PROFIT_TRIGGER_PCT:.0f}% trailing 활성화"
+                f"손절: ATR 기반(종목별) | +1R 1/3 부분익절 | 잔량 광폭 트레일"
             ))
     else:
         log.info("트레일링 손절 감시 대기 중 (초기 포지션 없음 — 큐/DB 동기화 대기)")
@@ -356,9 +402,10 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
     close_notified = not is_market_hours() and _now_kst() >= MARKET_CLOSE
     tick = 0
 
-    # 비블로킹 매도 상태: 매도 진행 중(selling)/완료(sold) ticker 추적
+    # 비블로킹 매도 상태: 매도 진행 중(selling)/완료(sold)/부분익절 진행(partialing) ticker 추적
     _selling: set[str] = set()
     _sold: set[str] = set()
+    _partialing: set[str] = set()
 
     while True:
         # ── 1. 큐에서 신규 포지션 흡수 (동일 프로세스 즉시 주입) ──
@@ -402,7 +449,7 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                             stop_price=float(r["stop_price"]),
                             peak_price=float(r["peak_price"]),
                             stop_pct=float(r.get("stop_pct") or 3.0),
-                            phase=r.get("phase", "stop"),
+                            phase=_load_phase(r),
                             entry_date=r.get("entry_date", datetime.now().strftime('%Y-%m-%d')),
                         )
                         pos_map[t] = new_pos
@@ -481,55 +528,26 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                         to_remove.append(ticker)
                     continue
 
-                # ── velocity 감지 → fast mode 전환 ──────────────
+                # ── velocity 감지 → fast mode 전환 (트레일 폭 축소) ──
                 if not pos.fast_mode and _detect_velocity(pos, price):
                     pos.fast_mode = True
-                    log.info("[%s] Fast mode 진입 (trail %.1f%% → %.1f%%)",
-                             ticker, PROFIT_TRAIL_PCT, FAST_TRAIL_PCT)
+                    log.info("[%s] Fast mode 진입 (trail 폭 ×%.0f → ×%.0f)",
+                             ticker, TRAIL_MULT, TRAIL_MULT_FAST)
                     bot_ui.schedule_message(
-                        f"⚡ *{pos.name}({ticker})* fast mode 진입\n"
-                        f"trail stop: {PROFIT_TRAIL_PCT:.1f}% → {FAST_TRAIL_PCT:.1f}%"
+                        f"⚡ *{pos.name}({ticker})* fast mode — 트레일 폭 축소(급락 대응)"
                     )
 
-                # ── Phase 전환: stop/even → trail (우선 체크) ────
-                if pos.phase in ('stop', 'even') and price >= pos.entry_price * (1 + PROFIT_TRIGGER_PCT / 100):
-                    new_stop = _trail_stop(price, fast=pos.fast_mode)
-                    pos.phase = 'trail'
-                    pos.stop_price = max(pos.stop_price, new_stop)
-                    pos.peak_price = price
-                    db.update_held_position(ticker, price, pos.stop_price, 'trail')
+                # ── +1R 도달 → 1/3 부분익절 + trail 전환 (백그라운드) ──
+                if pos.phase == 'stop' and ticker not in _partialing \
+                        and price >= pos.entry_price * (1 + pos.stop_pct * PARTIAL_TRIGGER_R / 100):
                     gain_pct = (price / pos.entry_price - 1) * 100
-                    trail_pct = FAST_TRAIL_PCT if pos.fast_mode else PROFIT_TRAIL_PCT
-                    log.info(
-                        "[%s] Phase trail 전환 (+%.1f%%) peak=%.0f stop=%.0f",
-                        ticker, gain_pct, price, pos.stop_price,
-                    )
-                    bot_ui.schedule_message(
-                        f"🟢 *{pos.name}({ticker})* trailing 활성화\n"
-                        f"진입가 {pos.entry_price:,.0f} → 현재 {price:,.0f} (+{gain_pct:.1f}%)\n"
-                        f"trailing stop: {pos.stop_price:,.0f} (peak -{trail_pct:.1f}%)"
-                    )
+                    log.info("[%s] +1R 도달 (+%.1f%%) — 부분익절+트레일 전환 시도", ticker, gain_pct)
+                    _partialing.add(ticker)
+                    asyncio.create_task(_take_partial_task(pos, price, _partialing))
 
-                # ── Phase 전환: stop → even (본전 보호) ──────────
-                elif pos.phase == 'stop' and price >= pos.entry_price * (1 + BREAKEVEN_TRIGGER_PCT / 100):
-                    pos.phase = 'even'
-                    pos.stop_price = pos.entry_price
-                    pos.peak_price = price
-                    db.update_held_position(ticker, price, pos.stop_price, 'even')
-                    gain_pct = (price / pos.entry_price - 1) * 100
-                    log.info(
-                        "[%s] Phase even 전환 (+%.1f%%) stop=본전 %.0f",
-                        ticker, gain_pct, pos.stop_price,
-                    )
-                    bot_ui.schedule_message(
-                        f"🔵 *{pos.name}({ticker})* 본전 보호 활성화\n"
-                        f"진입가 {pos.entry_price:,.0f} → 현재 {price:,.0f} (+{gain_pct:.1f}%)\n"
-                        f"손절가 본전으로 인상: {pos.stop_price:,.0f}"
-                    )
-
-                # ── Phase trail: peak 갱신 ────────────────────
+                # ── Phase trail: peak 갱신 → 트레일 손절가 상향 ──
                 elif pos.phase == 'trail' and price > pos.peak_price:
-                    new_stop = _trail_stop(price, fast=pos.fast_mode)
+                    new_stop = _trail_stop(price, pos.stop_pct, fast=pos.fast_mode)
                     if new_stop > pos.stop_price:
                         old_stop = pos.stop_price
                         pos.stop_price = new_stop
@@ -541,11 +559,11 @@ async def watch_trailing_stops(positions: list["TrailingPosition"]) -> None:
                 # ── 손절/익절 트리거 → 자동 매도 (실패/안전핀 시 수동 폴백) ──
                 if price <= pos.stop_price and _check_gap_down_buffer(pos, price):
                     continue  # W3: 갭다운 버퍼 대기 중
-                if price <= pos.stop_price:
+                if price <= pos.stop_price and ticker not in _partialing:
                     pnl_pct = (price / pos.entry_price - 1) * 100
                     prev_phase = pos.phase
-                    reason = "익절" if prev_phase == 'trail' else ("본전회수" if prev_phase == 'even' else "손절")
-                    emoji = "🟡" if prev_phase == 'trail' else ("🟠" if prev_phase == 'even' else "🔴")
+                    reason = "익절" if prev_phase == 'trail' else "손절"
+                    emoji = "🟡" if prev_phase == 'trail' else "🔴"
                     log.warning(
                         "[%s] %s 트리거 — 현재가=%.0f ≤ stop=%.0f (P&L=%.1f%%) → 자동 매도 시도",
                         ticker, reason, price, pos.stop_price, pnl_pct,
@@ -761,7 +779,7 @@ def load_held_positions() -> list["TrailingPosition"]:
             stop_price=  float(r["stop_price"]),
             peak_price=  float(r["peak_price"]),
             stop_pct=    float(r.get("stop_pct") or 3.0),
-            phase=       r.get("phase", "stop"),
+            phase=       _load_phase(r),
             entry_date=  r.get("entry_date", datetime.now().strftime('%Y-%m-%d')),
         ))
         _ws.subscribe_ticker(ticker)
@@ -778,12 +796,10 @@ def load_held_positions() -> list["TrailingPosition"]:
                 peak = max(entry, cur)
                 stop_pct = compute_stop_pct(ticker)
                 gain_pct = (cur / entry - 1) * 100 if entry > 0 and cur > 0 else 0.0
-                if gain_pct >= PROFIT_TRIGGER_PCT:
+                # 이미 +1R 이상이면 부분익절은 지나간 것으로 보고 trail로 등록
+                if gain_pct >= stop_pct * PARTIAL_TRIGGER_R:
                     phase = 'trail'
-                    stop = _trail_stop(peak)
-                elif gain_pct >= BREAKEVEN_TRIGGER_PCT:
-                    phase = 'even'
-                    stop = int(entry)
+                    stop = max(_fixed_stop(entry, stop_pct), _trail_stop(peak, stop_pct))
                 else:
                     phase = 'stop'
                     stop = _fixed_stop(entry, stop_pct)
