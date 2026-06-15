@@ -17,6 +17,7 @@ import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 
 UNIVERSE_SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 40
+TOP_SKIP = int(sys.argv[2]) if len(sys.argv) > 2 else 120  # 시총 상위 제외(대형주 배제→중소형)
 PERIOD_DAYS = 400
 COST_RT = 0.41
 ATR_MULT, STOP_FLOOR, STOP_CEIL = 1.5, 2.5, 6.0
@@ -35,24 +36,34 @@ CURATED = [
 ]
 
 
-def get_universe(n):
+def get_universe(n, top_skip=TOP_SKIP):
+    """KOSPI+KOSDAQ 시총 상위 top_skip개 제외 후 다음 n종목(중소형 밴드)."""
     try:
-        lst = fdr.StockListing("KOSPI")
+        frames = []
+        for mkt in ("KOSPI", "KOSDAQ"):
+            try:
+                frames.append(fdr.StockListing(mkt))
+            except Exception:
+                pass
+        lst = pd.concat(frames, ignore_index=True) if frames else fdr.StockListing("KOSPI")
         cols = lst.columns
         capcol = next((c for c in ["Marcap", "MarketCap", "시가총액"] if c in cols), None)
         codecol = "Code" if "Code" in cols else ("Symbol" if "Symbol" in cols else None)
         namecol = "Name" if "Name" in cols else None
         if capcol and codecol:
-            lst = lst.dropna(subset=[capcol]).sort_values(capcol, ascending=False)
+            lst = lst.dropna(subset=[capcol]).sort_values(capcol, ascending=False).reset_index(drop=True)
             out = []
-            for _, r in lst.iterrows():
+            for idx, r in lst.iterrows():
+                if idx < top_skip:
+                    continue
                 nm = str(r.get(namecol, "")) if namecol else ""
-                if any(k in nm for k in ["ETF", "ETN", "우", "스팩", "리츠", "인버스", "레버리지"]):
+                if any(k in nm for k in ["ETF", "ETN", "우", "스팩", "리츠", "인버스", "레버리지", "선물"]):
                     continue
                 out.append(str(r[codecol]).zfill(6))
                 if len(out) >= n:
                     break
             if out:
+                print(f"  유니버스: 중소형 {len(out)}종목 (시총 {top_skip}위 이후)")
                 return out
     except Exception as e:
         print(f"  (StockListing 폴백: {e})")

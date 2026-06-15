@@ -13,9 +13,11 @@ import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import FinanceDataReader as fdr
 
 UNIVERSE_SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 15
 PAGES = int(sys.argv[2]) if len(sys.argv) > 2 else 7   # 페이지당 ~25일
+TOP_SKIP = int(sys.argv[3]) if len(sys.argv) > 3 else 120  # 대형주 제외 → 중소형
 FWD_K = 10
 
 CURATED = [
@@ -27,6 +29,39 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
+
+
+def get_universe(n, top_skip=TOP_SKIP):
+    """KOSPI+KOSDAQ 시총 상위 top_skip 제외 후 다음 n종목(중소형). 실패 시 CURATED."""
+    try:
+        frames = []
+        for mkt in ("KOSPI", "KOSDAQ"):
+            try:
+                frames.append(fdr.StockListing(mkt))
+            except Exception:
+                pass
+        lst = pd.concat(frames, ignore_index=True)
+        cols = lst.columns
+        capcol = next((c for c in ["Marcap", "MarketCap", "시가총액"] if c in cols), None)
+        codecol = "Code" if "Code" in cols else ("Symbol" if "Symbol" in cols else None)
+        namecol = "Name" if "Name" in cols else None
+        lst = lst.dropna(subset=[capcol]).sort_values(capcol, ascending=False).reset_index(drop=True)
+        out = []
+        for idx, r in lst.iterrows():
+            if idx < top_skip:
+                continue
+            nm = str(r.get(namecol, "")) if namecol else ""
+            if any(k in nm for k in ["ETF", "ETN", "우", "스팩", "리츠", "인버스", "레버리지", "선물"]):
+                continue
+            out.append(str(r[codecol]).zfill(6))
+            if len(out) >= n:
+                break
+        if out:
+            print(f"  유니버스: 중소형 {len(out)}종목 (시총 {top_skip}위 이후)")
+            return out
+    except Exception as e:
+        print(f"  (StockListing 폴백: {e})")
+    return CURATED[:n]
 
 
 def _pint(s):
@@ -77,7 +112,7 @@ def main():
     print(f"■ 수급 팩터 IC (Naver frgn, {UNIVERSE_SIZE}종목 × {PAGES}p)\n")
     pool = []
     ok = 0
-    for code in CURATED[:UNIVERSE_SIZE]:
+    for code in get_universe(UNIVERSE_SIZE):
         df = fetch_frgn(code, PAGES)
         if df is None:
             print(f"  [{code}] 데이터 부족/실패")
