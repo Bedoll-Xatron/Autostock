@@ -297,17 +297,29 @@ class Scorer:
         return 1 if ratio < 0.6 else 0
 
     def _score_rs(self, charts: List[ChartData], kospi_return_20d: Optional[float]) -> int:
-        if len(charts) < 20 or kospi_return_20d is None:
+        """장기 상대모멘텀(검증된 알파, 백테스트 alpha +1.98%p).
+
+        6개월(126일, 최근 21일 스킵) 모멘텀으로 평가. 단기(20일) 모멘텀은 음(-)
+        알파였고 3~6개월이 강한 양(+)이라 horizon을 교체. 횡단면 선정에서는
+        KOSPI를 빼도 랭킹이 불변이므로 종목 자체 모멘텀으로 점수화한다.
+        차트가 부족하면 3개월(63일 스킵)로 폴백.
+        """
+        SKIP = 21
+        n = len(charts)
+        if n >= SKIP + 126 + 1:
+            base, past = charts[-1 - SKIP].close, charts[-1 - SKIP - 126].close
+        elif n >= SKIP + 63 + 1:
+            base, past = charts[-1 - SKIP].close, charts[-1 - SKIP - 63].close
+        else:
             return 0
-        price_now = charts[-1].close
-        price_20ago = charts[-20].close
-        if price_20ago <= 0:
+        if base <= 0 or past <= 0:
             return 0
-        stock_return = (price_now - price_20ago) / price_20ago * 100
-        excess = stock_return - kospi_return_20d
-        if excess >= 20:
+        mom = (base / past - 1) * 100
+        if mom >= 40:
+            return 3
+        if mom >= 20:
             return 2
-        if excess >= 10:
+        if mom >= 8:
             return 1
         return 0
 

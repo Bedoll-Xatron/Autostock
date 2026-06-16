@@ -184,9 +184,9 @@ class SignalGenerator:
         code = stock.code
 
         try:
-            # 1. 차트 데이터 130일 수집 (MA120 계산을 위해 여유분 포함)
+            # 1. 차트 데이터 170일 수집 (6개월 모멘텀 126+스킵21=147 + MA120 여유분)
             log.debug("  차트 수집...")
-            charts = get_chart_data(code, days=130)
+            charts = get_chart_data(code, days=170)
 
             # StockData OHLC/52주 보완 (API 원본에 없는 필드, 워치리스트 플레이스홀더 포함)
             if charts:
