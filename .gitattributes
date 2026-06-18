@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────
+# 줄바꿈(EOL) 정규화 — Windows(개발/운영) + macOS(개발) 혼용 안전
+# 저장소는 LF로 통일. 체크아웃 시에도 LF 유지(맥/윈도우 동일) → CRLF 혼입 방지.
+# ─────────────────────────────────────────────────────────────
+
+# 기본: 모든 텍스트 파일을 자동 인식하고 저장소·체크아웃 모두 LF
+* text=auto eol=lf
+
+# 소스/설정 텍스트 — 명시적으로 LF
+*.py     text eol=lf
+*.pyi    text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.json   text eol=lf
+*.jsonc  text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.toml   text eol=lf
+*.cfg    text eol=lf
+*.ini    text eol=lf
+*.sh     text eol=lf
+*.env    text eol=lf
+*.csv    text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Windows 전용 스크립트 — CRLF 유지 (윈도우 셸 호환)
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.ps1    text eol=crlf
+
+# 바이너리 — 변환/diff 금지
+*.zip    binary
+*.dzip   binary
+*.pap    binary
+*.pyc    binary
+*.pyd    binary
+*.so     binary
+*.dll    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.webp   binary
+*.pdf    binary
+*.xlsx   binary
+*.xls    binary
+*.parquet binary
+*.db     binary
+*.sqlite binary
